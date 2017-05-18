@@ -36,7 +36,7 @@ import shutil
 import tempfile
 import glob
 
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, TimeoutError
 from collections import Counter
 from obspy import Trace, Catalog, UTCDateTime, Stream, read, read_events
 from obspy.core.event import Event, Pick, CreationInfo, ResourceIdentifier
@@ -3761,7 +3761,7 @@ def match_filter(template_names, template_list, st, threshold,
                     raise MatchFilterError(
                         'Template sampling rate does not '
                         'match continuous data')
-    _spike_test(st, 0.99, 1e6)
+    _spike_test(st, 0.99, 1e6, cores=cores)
     # Copy the stream here because we will muck about with it
     stream = st.copy()
     templates = copy.deepcopy(template_list)
@@ -4029,9 +4029,33 @@ def match_filter(template_names, template_list, st, threshold,
         return detections, det_cat, detection_streams
 
 
-def _spike_test(stream, percent=0.99, multiplier=1e6):
+def _spike_detector(tr, percent=0.99, multiplier=1e6):
     """
-    Check for very large spikes in data and raise an error if found.
+    Check for very large spikes in data and write a message of disapprobation if found.
+
+    :param tr: Trace to look for spikes in.
+    :type tr: :class:`obspy.core.trace.Trace`
+    :param percent: Percentage as a decimal to calcualte range for.
+    :type percent: float
+    :param multiple: Multiplier of range to define a spike.
+    :type multiple: float
+    """
+    if (tr.data > 2 * np.max(
+        np.sort(np.abs(
+            tr))[0:int(percent * len(tr.data))]) * multiplier).sum() > 0:
+        msg = ('Spikes above ' + str(multiplier) +
+               ' of the range of ' + str(percent) +
+               ' of the data present, check. \n ' +
+               'This would otherwise likely result in an issue during ' +
+               'FFT prior to cross-correlation.\n' +
+               'If you think this spike is real please report ' +
+               'this as a bug.')
+        return msg
+    return None
+
+def _spike_test(stream, percent=0.99, multiplier=1e6, cores=False):
+    """
+    Check for very large spikes in data and raise an error at the first occurence if found.
 
     :param stream: Stream to look for spikes in.
     :type stream: :class:`obspy.core.stream.Stream`
@@ -4039,20 +4063,26 @@ def _spike_test(stream, percent=0.99, multiplier=1e6):
     :type percent: float
     :param multiple: Multiplier of range to define a spike.
     :type multiple: float
+    :param cores: Number of cores to use
+    :type cores: int
     """
-    for tr in stream:
-        if (tr.data > 2 * np.max(
-            np.sort(np.abs(
-                tr))[0:int(percent * len(tr.data))]) * multiplier).sum() > 0:
-            msg = ('Spikes above ' + str(multiplier) +
-                   ' of the range of ' + str(percent) +
-                   ' of the data present, check. \n ' +
-                   'This would otherwise likely result in an issue during ' +
-                   'FFT prior to cross-correlation.\n' +
-                   'If you think this spike is real please report ' +
-                   'this as a bug.')
-            raise MatchFilterError(msg)
-
+    list_of_traces=[]
+    for tr in stream.traces:
+        list_of_traces.append(tr)
+    if __name__ == '__main__':
+        if not cores:
+            cores = cpu_count()
+        pool = Pool(processes=cores)
+        results = [pool.apply_async(_spike_detector, args=(x, percent, multiplier)) for x in list_of_traces]
+        pool.close()
+        pool.join() 
+        try:
+            output = [p.get(timeout=1) for p in results]
+        except TimeoutError:
+            print "Multiprocessing when testing for big spikes took to much time and resulted in a multiprocessing.TimeoutError."
+        for msg in output:
+            if msg is not None:
+                raise MatchFilterError(msg)
 
 if __name__ == "__main__":
     import doctest
